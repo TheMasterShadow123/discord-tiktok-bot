@@ -4,6 +4,8 @@ import sys
 import yt_dlp
 import asyncio
 import subprocess
+import time
+from typing import Literal
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
@@ -24,127 +26,158 @@ class TiktokBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
-        print("Synced slash commands!")
+        print("✅ Slash commands synced!")
 
 bot = TiktokBot()
 
-async def compress_video(input_path, output_path, target_size_mb):
-    probe_cmd = [
-        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1', input_path
-    ]
-    try:
-        duration = float(subprocess.check_output(probe_cmd).decode().strip())
-    except Exception as e:
-        print(f"❌ FFprobe failed: {e}")
-        return False
-
-    target_total_bitrate = (target_size_mb * 0.90 * 8192 * 1000) / duration
-    audio_bitrate = 128 * 1000
-    video_bitrate = target_total_bitrate - audio_bitrate
-
-    if video_bitrate < 100000:
-        video_bitrate = 100000
-
-    vf_filter = "scale='min(720,iw)':-2,fps=30,format=yuv420p"
-
-    print(f"ℹ️ Compressing to 720p/30fps @ {int(video_bitrate/1000)}kbit/s")
-
+async def convert_to_h264(input_path, output_path):
     cmd = [
         'ffmpeg', '-y', '-i', input_path,
-        '-vf', vf_filter,
-        '-af', 'aresample=async=1',
         '-c:v', 'libx264',
-        '-b:v', str(int(video_bitrate)),
-        '-maxrate', str(int(video_bitrate * 1.5)),
-        '-bufsize', str(int(video_bitrate * 2)),
-        '-preset', 'veryfast',
-        '-c:a', 'aac', '-b:a', '128k',
+        '-pix_fmt', 'yuv420p',
+        '-profile:v', 'main',
+        '-level', '4.2',
+        '-preset', 'medium',
+        '-crf', '23',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
         output_path
     ]
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd, stdout=subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-    )
-    _, stderr = await process.communicate()
-
+    process = await asyncio.create_subprocess_exec(*cmd)
+    await process.wait()
+    
     if process.returncode != 0:
-        print(f"❌ FFmpeg Error:\n{stderr.decode()}")
+        print(f"❌ Transcode failed with code {process.returncode}")
+        return False
+    return True
+
+async def emergency_compress(input_path, output_path, target_size_mb):
+    probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_path]
+    try:
+        duration = float(subprocess.check_output(probe_cmd).decode().strip())
+    except:
         return False
 
+    target_bitrate = (target_size_mb * 0.9 * 8192 * 1000) / duration
+
+    cmd = [
+        'ffmpeg', '-y', '-i', input_path,
+        '-vf', "scale='min(1280,iw)':-2,fps=30",
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-b:v', str(int(target_bitrate)),
+        '-maxrate', str(int(target_bitrate * 1.5)),
+        '-bufsize', str(int(target_bitrate * 2)),
+        '-preset', 'veryfast',
+        '-c:a', 'aac', '-b:a', '96k',
+        '-movflags', '+faststart',
+        output_path
+    ]
+    
+    process = await asyncio.create_subprocess_exec(*cmd)
+    await process.wait()
     return os.path.exists(output_path)
 
 @bot.tree.command(name="tiktok", description="Download a TikTok video")
-@app_commands.describe(url="Paste the TikTok link here")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def tiktok(interaction: discord.Interaction, url: str):
-    if "tiktok.com" not in url:
-        await interaction.response.send_message("❌ That doesn't look like a valid TikTok link.", ephemeral=True)
-        return
-
+@app_commands.describe(
+    url="Paste the TikTok link here", 
+    mode="Auto: Optimizes for Discord. Full: Raw upload (May fail if >10MB)"
+)
+async def tiktok(
+    interaction: discord.Interaction, 
+    url: str, 
+    mode: Literal['Auto (Smart)', 'Full (Raw)'] = 'Auto (Smart)'
+):
     await interaction.response.defer(thinking=True)
+    
+    async def update_status(text):
+        try:
+            await interaction.edit_original_response(content=text)
+        except:
+            pass
 
+    await update_status("⬇️ Downloading... (Fetching from TikTok)")
+    print(f"⬇️ Downloading: {url}")
+    
+    timestamp = int(time.time())
+    
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': '%(title)s-%(id)s.%(ext)s',
+        'outtmpl': f'temp_{timestamp}_%(id)s.%(ext)s',
         'cookiefile': COOKIES_FILE,
         'noplaylist': True,
-        'quiet': True,
-        'external_downloader': 'aria2c',
-        'external_downloader_args': ['-x', '16', '-k', '1M'],
+        'quiet': False,
+        'no_warnings': False, 
+        'format': 'best', 
     }
 
-    filename = None
+    raw_filename = None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            raw_filename = ydl.prepare_filename(info)
+            if not os.path.exists(raw_filename):
+                 base, _ = os.path.splitext(raw_filename)
+                 for ext in ['.mp4', '.mkv', '.webm']:
+                     if os.path.exists(base + ext): raw_filename = base + ext; break
+    except Exception as e:
+        await interaction.followup.send(f"❌ Download failed: {e}")
+        return
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                break
-        except Exception as e:
-            error_msg = str(e)
-            if "Unable to extract webpage" in error_msg or "403" in error_msg:
-                print(f"⚠️ Attempt {attempt+1} failed. Retrying...")
-                await asyncio.sleep(2)
-                if attempt == max_retries - 1:
-                    await interaction.followup.send("❌ TikTok blocked the download (Try again later).")
-                    return
+    final_file = None
+
+    if raw_filename and os.path.exists(raw_filename):
+        if mode == 'Full (Raw)':
+            await update_status("📦 Preparing Raw Upload... (Skipping conversion)")
+            final_file = raw_filename
+
+        else:
+            hq_filename = f"hq_{timestamp}.mp4"
+            
+            await update_status("🎬 Transcoding... (Fixing for Windows/Discord)")
+            success = await convert_to_h264(raw_filename, hq_filename)
+            
+            if success and os.path.exists(hq_filename):
+                size_mb = os.path.getsize(hq_filename) / (1024 * 1024)
+                
+                if size_mb > MAX_SIZE_MB:
+                    await update_status(f"📉 Compressing... ({size_mb:.1f}MB -> 10MB)")
+                    compressed_filename = f"small_{timestamp}.mp4"
+                    await emergency_compress(hq_filename, compressed_filename, MAX_SIZE_MB)
+                    
+                    final_file = compressed_filename
+                    if os.path.exists(hq_filename): os.remove(hq_filename)
+                else:
+                    final_file = hq_filename
             else:
-                await interaction.followup.send(f"❌ Download failed: {error_msg}")
+                await interaction.followup.send("❌ Processing failed.")
                 return
 
-    if filename and os.path.exists(filename):
-        try:
-            file_size_mb = os.path.getsize(filename) / (1024 * 1024)
-
-            if file_size_mb > MAX_SIZE_MB:
-                await interaction.followup.send(f"⚠️ Video is {file_size_mb:.1f}MB. Optimizing...", ephemeral=True)
-
-                compressed_filename = f"compressed_{filename}"
-                success = await compress_video(filename, compressed_filename, MAX_SIZE_MB)
-
-                if success:
-                    os.remove(filename)
-                    filename = compressed_filename
-                else:
-                    await interaction.followup.send("❌ Compression failed (Check logs). Uploading original...", ephemeral=True)
-
-            await interaction.followup.send(file=discord.File(filename))
-
-        except discord.HTTPException as e:
-            await interaction.followup.send(f"❌ Upload Failed: {e}")
-        finally:
-            if os.path.exists(filename):
-                os.remove(filename)
+        if final_file and os.path.exists(final_file):
+            await update_status("🚀 Uploading to Discord...")
+            print(f"🚀 Uploading: {final_file}")
+            try:
+                await interaction.followup.send(
+                    content="", 
+                    file=discord.File(final_file, filename="1.mp4")
+                )
+                await interaction.delete_original_response()
+                
+            except Exception as e:
+                print(f"❌ Upload Error: {e}")
+                await interaction.followup.send(f"❌ Upload Failed: {e}")
+            finally:
+                if os.path.exists(final_file): os.remove(final_file)
+        
+        if os.path.exists(raw_filename): os.remove(raw_filename)
+    else:
+        await interaction.followup.send("❌ Error: File not found after download.")
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user}')
+    print(f'✅ Logged in as {bot.user}')
 
-if not TOKEN:
-    print("❌ Error: DISCORD_TOKEN not found. Did you create the .env file?")
-else:
+if TOKEN:
     bot.run(TOKEN)
+else:
+    print("❌ DISCORD_TOKEN missing in .env")
